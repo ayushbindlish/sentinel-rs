@@ -1,0 +1,14 @@
+[package]
+name = "sentinel-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Ayush Bindlish <ayushbindlish96@gmail.com>"]
+
+[dependencies]
+reqwest = { version = "0.12.26", features = ["json","blocking"] }
+serde_json = "*"
+chrono = { version = "0.4" }
+hostname = "0.4.2"
+log = "0.4"
+env_logger = "0.11.8"
