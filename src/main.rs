@@ -1,4 +1,4 @@
-use chrono::{Local};
+use chrono::Local;
 use hostname::get;
 use log::info;
 use reqwest::blocking::Client;
@@ -6,9 +6,11 @@ use serde_json::json;
 use std::env;
 use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
-fn env_required(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| panic!("Environment variable {key} is required"))
+fn env_required(key: &str) -> Result<String, std::env::VarError> {
+    std::env::var(key)
 }
 
 fn format_message(ts: &str, host: &str, text: &str) -> String {
@@ -23,73 +25,98 @@ fn telegram_payload(chat_id: &str, body: &str) -> serde_json::Value {
     })
 }
 
-fn tg_send(text: &str) {
-    let bot_token = env_required("TG_BOT_TOKEN");
-    let chat_id = env_required("TG_CHAT_ID");
+fn tg_send(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let bot_token = env_required("TG_BOT_TOKEN")?;
+    let chat_id = env_required("TG_CHAT_ID")?;
     let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
     let host = get().unwrap_or_default().to_string_lossy().to_string();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let body = format_message(&ts, &host, text);
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("Failed to build HTTP client");
-    let res = client
+        .build()?;
+    client
         .post(&url)
         .json(&telegram_payload(&chat_id, &body))
-        .send();
-    if let Err(e) = res {
-        eprintln!("Failed to send Telegram message: {e}");
-    }
+        .send()?;
+    Ok(())
 }
 
-fn read_stream<R: Read, W: Write>(mut reader: R, mut writer: W, tee: bool) -> Vec<u8> {
+fn start_notifier() -> (mpsc::Sender<String>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<String>();
+    let handle = thread::spawn(move || {
+        for msg in rx {
+            if let Err(e) = tg_send(&msg) {
+                eprintln!("Failed to send telegram message: {e}");
+            }
+        }
+    });
+    (tx, handle)
+}
+
+fn read_stream<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    tee: bool,
+) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = reader.read(&mut chunk).expect("Failed to read stream");
+        let read = reader.read(&mut chunk)?;
         if read == 0 {
             break;
         }
         if tee {
-            writer
-                .write_all(&chunk[..read])
-                .expect("Failed to write stream");
+            writer.write_all(&chunk[..read])?;
             writer.flush().ok();
         }
         buf.extend_from_slice(&chunk[..read]);
     }
-    buf
+    Ok(buf)
 }
 
-fn run_bash_with_tee(command: &str, tee: bool) -> Output {
+fn run_bash_with_tee(command: &str, tee: bool) -> std::io::Result<Output> {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(command)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to execute command");
+        .spawn()?;
 
-    let mut stdout = child.stdout.take().expect("Failed to capture stdout");
-    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("Failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("Failed to capture stderr"))?;
 
     let stdout_handle = std::thread::spawn(move || read_stream(stdout, std::io::stdout(), tee));
     let stderr_handle = std::thread::spawn(move || read_stream(stderr, std::io::stderr(), tee));
 
-    let status = child.wait().expect("Failed to wait on child");
-    let out_buf = stdout_handle.join().expect("Failed to join stdout thread");
-    let err_buf = stderr_handle.join().expect("Failed to join stderr thread");
+    let status = child.wait()?;
+    let out_buf = stdout_handle
+        .join()
+        .map_err(|_| std::io::Error::other("Failed to capture stdout"))?;
+    let err_buf = stderr_handle
+        .join()
+        .map_err(|_| std::io::Error::other("Failed to capture stderr"))?;
 
-    Output {
+    Ok(Output {
         status,
-        stdout: out_buf,
-        stderr: err_buf,
-    }
+        stdout: out_buf?,
+        stderr: err_buf?,
+    })
 }
 
-fn run_bash(command: &str) -> Output {
-    run_bash_with_tee(command, true)
+fn run_bash(command: &str) -> std::io::Result<Output> {
+    run_bash_with_tee(command, true).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("Failed to run bash command '{command}': {e}"),
+        )
+    })
 }
 
 fn tail_bytes(buf: &[u8], max: usize) -> String {
@@ -112,27 +139,45 @@ fn main() {
         eprintln!("Usage: sentinel-rs <any text to send on startup>");
         std::process::exit(2);
     }
-    let command = args.join(" ");
-    tg_send(&format!("Started\n{command}"));
 
-    let output = run_bash(&command);
+    let command = args.join(" ");
+
+    let (notifier, handle) = start_notifier();
+    notifier.send(format!("Started\n{command}")).ok();
+
+    let output = match run_bash(&command) {
+        Ok(output) => output,
+        Err(e) => {
+            notifier
+                .send(format!("Failed to execute command: {e}"))
+                .ok();
+            info!("Failed to execute command: {e}");
+            drop(notifier);
+            handle.join().ok();
+            return;
+        }
+    };
 
     match output.status.code() {
         Some(0) => {
-            tg_send(&format!(
-                "Finished successfully with exit code 0.\nStdout:\n{}\nStderr:\n{}",
-                tail_bytes(&output.stdout, 1500),
-                tail_bytes(&output.stderr, 1500)
-            ));
+            notifier
+                .send(format!(
+                    "Finished successfully with exit code 0.\nStdout:\n{}\nStderr:\n{}",
+                    tail_bytes(&output.stdout, 1500),
+                    tail_bytes(&output.stderr, 1500)
+                ))
+                .ok();
             info!("Command finished successfully with exit code 0");
         }
         Some(code) => {
-            tg_send(&format!(
-                "Failed with exit code: {}.\nStdout:\n{}\nStderr:\n{}",
-                code,
-                tail_bytes(&output.stdout, 1500),
-                tail_bytes(&output.stderr, 1500)
-            ));
+            notifier
+                .send(format!(
+                    "Failed with exit code: {}.\nStdout:\n{}\nStderr:\n{}",
+                    code,
+                    tail_bytes(&output.stdout, 1500),
+                    tail_bytes(&output.stderr, 1500)
+                ))
+                .ok();
             info!(
                 "Failed with exit code: {}. Stdout: {} Stderr: {}",
                 code,
@@ -141,14 +186,18 @@ fn main() {
             );
         }
         None => {
-            tg_send(&format!(
-                "Process terminated by signal.\nStdout:\n{}\nStderr:\n{}",
-                tail_bytes(&output.stdout, 1500),
-                tail_bytes(&output.stderr, 1500)
-            ));
+            notifier
+                .send(format!(
+                    "Process terminated by signal.\nStdout:\n{}\nStderr:\n{}",
+                    tail_bytes(&output.stdout, 1500),
+                    tail_bytes(&output.stderr, 1500)
+                ))
+                .ok();
             info!("Process terminated by signal.");
         }
     }
+    drop(notifier);
+    handle.join().ok();
 }
 
 #[cfg(test)]
@@ -156,10 +205,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_required_missing_panics() {
+    fn env_required_present_returns_value() {
+        let key = "SENTINEL_RS_TEST_ENV";
+        let value = "test_value".to_string();
+        let prior = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, &value);
+        }
+        let result = env_required(key).unwrap();
+        unsafe {
+            if let Some(prior) = prior {
+                std::env::set_var(key, prior);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        assert_eq!(result, value);
+    }
+
+    #[test]
+    fn env_required_missing_returns_err() {
         let key = "SENTINEL_RS_TEST_MISSING_ENV";
-        std::env::remove_var(key);
-        let result = std::panic::catch_unwind(|| env_required(key));
+        unsafe {
+            std::env::remove_var(key);
+        }
+        let result = env_required(key);
         assert!(result.is_err());
     }
 
@@ -178,8 +248,36 @@ mod tests {
     }
 
     #[test]
+    fn tail_bytes_truncates_correctly() {
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        let result = tail_bytes(data, 10);
+        assert_eq!(result, "… (truncated, showing last 10 bytes)\nqrstuvwxyz");
+    }
+
+    #[test]
+    fn tail_bytes_no_truncation() {
+        let data = b"hello";
+        let result = tail_bytes(data, 10);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn tail_bytes_exact_boundary() {
+        let data = b"exact10!!";
+        let result = tail_bytes(data, 9);
+        assert_eq!(result, "exact10!!");
+    }
+
+    #[test]
+    fn tail_bytes_handles_non_utf8() {
+        let data = [0x66, 0xff, 0x6f];
+        let result = tail_bytes(&data, 10);
+        assert_eq!(result, String::from_utf8_lossy(&data));
+    }
+
+    #[test]
     fn run_bash_captures_stdout_and_stderr() {
-        let output = run_bash_with_tee("printf 'out'; printf 'err' 1>&2", false);
+        let output = run_bash_with_tee("printf 'out'; printf 'err' 1>&2", false).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
@@ -187,7 +285,27 @@ mod tests {
 
     #[test]
     fn run_bash_captures_non_zero_exit() {
-        let output = run_bash_with_tee("exit 7", false);
+        let output = run_bash_with_tee("exit 7", false).unwrap();
         assert_eq!(output.status.code(), Some(7));
+    }
+
+    #[test]
+    fn read_stream_no_tee_keeps_writer_empty() {
+        use std::io::Cursor;
+        let input_data = Cursor::new(b"hello world");
+        let mut output = Vec::new();
+        let buf = read_stream(input_data, &mut output, false).expect("Failed to read stream");
+        assert_eq!(buf, b"hello world");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn read_stream_copies_when_tee_true() {
+        use std::io::Cursor;
+        let input_data = Cursor::new(b"hello world");
+        let mut output = Vec::new();
+        let buf = read_stream(input_data, &mut output, true).expect("Failed to read stream");
+        assert_eq!(buf, b"hello world");
+        assert_eq!(output, b"hello world");
     }
 }

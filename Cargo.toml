@@ -6,8 +6,8 @@ license = "Apache-2.0"
 authors = ["Ayush Bindlish <ayushbindlish96@gmail.com>"]
 
 [dependencies]
-reqwest = { version = "0.12.26", features = ["json","blocking"] }
-serde_json = "*"
+reqwest = { version = "0.12.28", features = ["json","blocking"] }
+serde_json = "1.0.146"
 chrono = { version = "0.4" }
 hostname = "0.4.2"
 log = "0.4"
