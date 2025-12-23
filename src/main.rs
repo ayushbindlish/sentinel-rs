@@ -132,15 +132,46 @@ fn tail_bytes(buf: &[u8], max: usize) -> String {
     }
 }
 
+fn print_help() {
+    eprintln!(
+        "Usage: sentinel-rs [--help] [--version] [-- <command>...]\n\
+Runs a command via bash -c and sends Telegram notifications.\n\n\
+Examples:\n\
+  sentinel-rs -- \"echo hello\"\n\
+  sentinel-rs -- ls -la\n\
+  sentinel-rs -- --help   # runs a command named \"--help\""
+    );
+}
+
 fn main() {
     env_logger::init();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("Usage: sentinel-rs <any text to send on startup>");
+        print_help();
         std::process::exit(2);
     }
 
-    let command = args.join(" ");
+    if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
+        print_help();
+        return;
+    }
+
+    if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+        eprintln!("sentinel-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    let command_args = if args[0] == "--" {
+        if args.len() == 1 {
+            eprintln!("Missing command after --.");
+            print_help();
+            std::process::exit(2);
+        }
+        &args[1..]
+    } else {
+        &args[..]
+    };
+    let command = command_args.join(" ");
 
     let (notifier, handle) = start_notifier();
     notifier.send(format!("Started\n{command}")).ok();
