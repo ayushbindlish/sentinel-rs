@@ -185,11 +185,11 @@ fn main() {
             info!("Failed to execute command: {e}");
             drop(notifier);
             handle.join().ok();
-            return;
+            std::process::exit(1);
         }
     };
 
-    match output.status.code() {
+    let exit_code = match output.status.code() {
         Some(0) => {
             notifier
                 .send(format!(
@@ -199,6 +199,7 @@ fn main() {
                 ))
                 .ok();
             info!("Command finished successfully with exit code 0");
+            0
         }
         Some(code) => {
             notifier
@@ -215,6 +216,7 @@ fn main() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            code
         }
         None => {
             notifier
@@ -225,10 +227,12 @@ fn main() {
                 ))
                 .ok();
             info!("Process terminated by signal.");
+            128
         }
-    }
+    };
     drop(notifier);
     handle.join().ok();
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
