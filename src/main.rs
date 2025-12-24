@@ -25,10 +25,15 @@ fn telegram_payload(chat_id: &str, body: &str) -> serde_json::Value {
     })
 }
 
+fn tg_api_base() -> String {
+    let base = env::var("TG_API_BASE").unwrap_or_else(|_| "https://api.telegram.org".to_string());
+    base.trim_end_matches('/').to_string()
+}
+
 fn tg_send(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     let bot_token = env_required("TG_BOT_TOKEN")?;
     let chat_id = env_required("TG_CHAT_ID")?;
-    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let url = format!("{}/bot{bot_token}/sendMessage", tg_api_base());
     let host = get().unwrap_or_default().to_string_lossy().to_string();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let body = format_message(&ts, &host, text);
@@ -79,6 +84,7 @@ fn run_bash_with_tee(command: &str, tee: bool) -> std::io::Result<Output> {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(command)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

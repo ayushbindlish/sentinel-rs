@@ -1,8 +1,0 @@
-[build]
-rustc-wrapper = "sccache"
-
-[term]
-color = "always"
-
-[net]
-git-fetch-with-cli = true
