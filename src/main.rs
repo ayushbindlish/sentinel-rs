@@ -9,8 +9,30 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
+struct TgConfig {
+    bot_token: String,
+    chat_id: String,
+    api_base: String,
+}
+
 fn env_required(key: &str) -> Result<String, std::env::VarError> {
-    std::env::var(key)
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => Ok(v),
+        Ok(_) => Err(std::env::VarError::NotPresent),
+        Err(e) => Err(e),
+    }
+}
+
+fn load_tg_config() -> Result<TgConfig, Box<dyn std::error::Error>> {
+    let bot_token = env_required("TG_BOT_TOKEN")?;
+    let chat_id = env_required("TG_CHAT_ID")?;
+    let api_base =
+        env::var("TG_API_BASE").unwrap_or_else(|_| "https://api.telegram.org/".to_string());
+    Ok(TgConfig {
+        bot_token,
+        chat_id,
+        api_base: api_base.trim_end_matches('/').to_string(),
+    })
 }
 
 fn format_message(ts: &str, host: &str, text: &str) -> String {
@@ -25,15 +47,11 @@ fn telegram_payload(chat_id: &str, body: &str) -> serde_json::Value {
     })
 }
 
-fn tg_api_base() -> String {
-    let base = env::var("TG_API_BASE").unwrap_or_else(|_| "https://api.telegram.org".to_string());
-    base.trim_end_matches('/').to_string()
-}
+fn tg_send(cfg: &TgConfig, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let bot_token = cfg.bot_token.trim();
+    let chat_id = cfg.chat_id.trim();
+    let url = format!("{}/bot{bot_token}/sendMessage", cfg.api_base);
 
-fn tg_send(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let bot_token = env_required("TG_BOT_TOKEN")?;
-    let chat_id = env_required("TG_CHAT_ID")?;
-    let url = format!("{}/bot{bot_token}/sendMessage", tg_api_base());
     let host = get().unwrap_or_default().to_string_lossy().to_string();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let body = format_message(&ts, &host, text);
@@ -42,16 +60,16 @@ fn tg_send(text: &str) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     client
         .post(&url)
-        .json(&telegram_payload(&chat_id, &body))
+        .json(&telegram_payload(chat_id, &body))
         .send()?;
     Ok(())
 }
 
-fn start_notifier() -> (mpsc::Sender<String>, thread::JoinHandle<()>) {
+fn start_notifier(cfg: TgConfig) -> (mpsc::Sender<String>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
         for msg in rx {
-            if let Err(e) = tg_send(&msg) {
+            if let Err(e) = tg_send(&cfg, &msg) {
                 eprintln!("Failed to send telegram message: {e}");
             }
         }
@@ -179,7 +197,15 @@ fn main() {
     };
     let command = command_args.join(" ");
 
-    let (notifier, handle) = start_notifier();
+    let tg_config = match load_tg_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Failed to load Telegram configuration: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let (notifier, handle) = start_notifier(tg_config);
     notifier.send(format!("Started\n{command}")).ok();
 
     let output = match run_bash(&command) {
@@ -272,6 +298,58 @@ mod tests {
         }
         let result = env_required(key);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_tg_tokens_set_rejects_empty_values() {
+        let token_key = "TG_BOT_TOKEN";
+        let chat_key = "TG_CHAT_ID";
+        let prior_token = std::env::var(token_key).ok();
+        let prior_chat = std::env::var(chat_key).ok();
+        unsafe {
+            std::env::set_var(token_key, "   ");
+            std::env::set_var(chat_key, "123");
+        }
+        let result = load_tg_config();
+        unsafe {
+            if let Some(prior) = prior_token {
+                std::env::set_var(token_key, prior);
+            } else {
+                std::env::remove_var(token_key);
+            }
+            if let Some(prior) = prior_chat {
+                std::env::set_var(chat_key, prior);
+            } else {
+                std::env::remove_var(chat_key);
+            }
+        }
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_tg_tokens_set_accepts_non_empty_values() {
+        let token_key = "TG_BOT_TOKEN";
+        let chat_key = "TG_CHAT_ID";
+        let prior_token = std::env::var(token_key).ok();
+        let prior_chat = std::env::var(chat_key).ok();
+        unsafe {
+            std::env::set_var(token_key, "token");
+            std::env::set_var(chat_key, "123");
+        }
+        let result = load_tg_config();
+        unsafe {
+            if let Some(prior) = prior_token {
+                std::env::set_var(token_key, prior);
+            } else {
+                std::env::remove_var(token_key);
+            }
+            if let Some(prior) = prior_chat {
+                std::env::set_var(chat_key, prior);
+            } else {
+                std::env::remove_var(chat_key);
+            }
+        }
+        assert!(result.is_ok());
     }
 
     #[test]
