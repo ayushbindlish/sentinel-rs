@@ -16,11 +16,11 @@ struct TgConfig {
 }
 
 fn env_required(key: &str) -> Result<String, std::env::VarError> {
-    match std::env::var(key) {
-        Ok(v) if !v.trim().is_empty() => Ok(v),
-        Ok(_) => Err(std::env::VarError::NotPresent),
-        Err(e) => Err(e),
+    let value = std::env::var(key)?;
+    if value.trim().is_empty() {
+        return Err(std::env::VarError::NotPresent);
     }
+    Ok(value)
 }
 
 fn load_tg_config() -> Result<TgConfig, Box<dyn std::error::Error>> {
@@ -29,8 +29,8 @@ fn load_tg_config() -> Result<TgConfig, Box<dyn std::error::Error>> {
     let api_base =
         env::var("TG_API_BASE").unwrap_or_else(|_| "https://api.telegram.org/".to_string());
     Ok(TgConfig {
-        bot_token,
-        chat_id,
+        bot_token: bot_token.trim().to_string(),
+        chat_id: chat_id.trim().to_string(),
         api_base: api_base.trim_end_matches('/').to_string(),
     })
 }
@@ -47,29 +47,28 @@ fn telegram_payload(chat_id: &str, body: &str) -> serde_json::Value {
     })
 }
 
-fn tg_send(cfg: &TgConfig, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let bot_token = cfg.bot_token.trim();
-    let chat_id = cfg.chat_id.trim();
-    let url = format!("{}/bot{bot_token}/sendMessage", cfg.api_base);
+fn tg_send(client: &Client, cfg: &TgConfig, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/bot{}/sendMessage", cfg.api_base, cfg.bot_token);
 
     let host = get().unwrap_or_default().to_string_lossy().to_string();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let body = format_message(&ts, &host, text);
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
     client
         .post(&url)
-        .json(&telegram_payload(chat_id, &body))
+        .json(&telegram_payload(&cfg.chat_id, &body))
         .send()?;
     Ok(())
 }
 
 fn start_notifier(cfg: TgConfig) -> (mpsc::Sender<String>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<String>();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new());
     let handle = thread::spawn(move || {
         for msg in rx {
-            if let Err(e) = tg_send(&cfg, &msg) {
+            if let Err(e) = tg_send(&client, &cfg, &msg) {
                 eprintln!("Failed to send telegram message: {e}");
             }
         }
@@ -82,6 +81,8 @@ fn read_stream<R: Read, W: Write>(
     mut writer: W,
     tee: bool,
 ) -> std::io::Result<Vec<u8>> {
+    // Limit capture to ~16KB
+    const MAX_CAPTURE: usize = 16 * 1024;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -94,6 +95,11 @@ fn read_stream<R: Read, W: Write>(
             writer.flush().ok();
         }
         buf.extend_from_slice(&chunk[..read]);
+
+        // If buffer grows too large, truncate the beginning
+        if buf.len() > MAX_CAPTURE * 2 {
+            buf.drain(..buf.len() - MAX_CAPTURE);
+        }
     }
     Ok(buf)
 }
@@ -301,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_tg_tokens_set_rejects_empty_values() {
+    fn load_tg_config_rejects_empty_values() {
         let token_key = "TG_BOT_TOKEN";
         let chat_key = "TG_CHAT_ID";
         let prior_token = std::env::var(token_key).ok();
