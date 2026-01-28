@@ -11,12 +11,18 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Show Rust toolchain
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: Build (default host toolchain)
+        run: cargo build --verbose --target x86_64-unknown-linux-gnu
+
+      - name: Test (default host toolchain)
+        run: cargo test --verbose --target x86_64-unknown-linux-gnu
